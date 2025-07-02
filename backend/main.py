@@ -1,6 +1,5 @@
-from fastapi import FastAPI, File, UploadFile
-from fastapi.responses import JSONResponse
-from fastapi.middleware.cors import CORSMiddleware
+from flask import Flask, request, jsonify
+from flask_cors import CORS
 import easyocr
 from PIL import Image
 import numpy as np
@@ -9,18 +8,10 @@ from sqlalchemy import create_engine, Column, Integer, String, JSON, TIMESTAMP
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker
 from datetime import datetime
+import re
 
-# Initialize FastAPI app
-app = FastAPI()
-
-# Enable CORS
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],  # For production, restrict appropriately
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+app = Flask(__name__)
+CORS(app)
 
 # Initialize EasyOCR reader
 reader = easyocr.Reader(['en'])
@@ -40,9 +31,9 @@ class PassportData(Base):
 
 Base.metadata.create_all(bind=engine)
 
-@app.get("/")
-async def root():
-    return {"message": "Passport OCR FastAPI Backend Working"}
+@app.route("/", methods=["GET"])
+def root():
+    return jsonify({"message": "Passport OCR Flask Backend Working"})
 
 def parse_mrz(mrz_lines):
     data = {}
@@ -75,12 +66,12 @@ def parse_mrz(mrz_lines):
 
     return data
 
-
-@app.post("/upload")
-async def upload_image(file: UploadFile = File(...)):
+@app.route("/upload", methods=["POST"])
+def upload_image():
     try:
         print("== Upload endpoint called ==")
-        contents = await file.read()
+        file = request.files["file"]
+        contents = file.read()
         print(f"File read: {len(contents)} bytes")
 
         image = Image.open(io.BytesIO(contents)).convert('RGB')
@@ -90,16 +81,35 @@ async def upload_image(file: UploadFile = File(...)):
 
         # Perform OCR using EasyOCR
         results = reader.readtext(image_array, detail=0, paragraph=False)
-        print(f"OCR Raw Results: {results}")
+        print(f"OCR Results: {results}")
 
-        # Extract MRZ lines: typically the last 2 lines of passport
+        # Extract MRZ lines
         mrz_lines = results[-2:] if len(results) >= 2 else results
         mrz_lines = [line.replace(" ", "").replace("\n", "") for line in mrz_lines]
         print(f"Detected MRZ Lines: {mrz_lines}")
 
-        # Parse structured MRZ data
         structured_data = parse_mrz(mrz_lines)
-        print(f"Parsed Structured Data: {structured_data}")
+
+        # Extract 'date_of_issue' from OCR results
+        date_of_issue = None
+        for line in results:
+            found_dates = re.findall(r'\d{2}/\d{2}/\d{4}', line)
+            for dt in found_dates:
+                # Convert to YYYY-MM-DD
+                day, month, year = dt.split("/")
+                formatted_date = f"{year}-{month}-{day}"
+                if (
+                    formatted_date != structured_data.get('date_of_birth') and
+                    formatted_date != structured_data.get('expiration_date')
+                ):
+                    date_of_issue = formatted_date
+                    break
+            if date_of_issue:
+                break
+
+        if date_of_issue:
+            structured_data['date_of_issue'] = date_of_issue
+            print(f"Date of Issue found: {date_of_issue}")
 
         # Save to database
         db = SessionLocal()
@@ -113,8 +123,7 @@ async def upload_image(file: UploadFile = File(...)):
         db.close()
         print(f"Saved entry with ID: {passport_entry.id}")
 
-        # Return with 'extracted_text' key for frontend compatibility
-        return JSONResponse(content={
+        return jsonify({
             "id": passport_entry.id,
             "filename": file.filename,
             "extracted_text": structured_data,
@@ -123,5 +132,8 @@ async def upload_image(file: UploadFile = File(...)):
 
     except Exception as e:
         print(f"Error: {e}")
-        return JSONResponse(content={"error": str(e)}, status_code=500)
+        return jsonify({"error": str(e)}), 500
+
+if __name__ == "__main__":
+    app.run(debug=True, port=8000)
 
