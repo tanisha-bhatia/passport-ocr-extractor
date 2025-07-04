@@ -1,20 +1,14 @@
 from flask import Flask, request, jsonify
 from flask_cors import CORS
-import easyocr
-from PIL import Image
-import numpy as np
-import io
+import requests
+import re
 from sqlalchemy import create_engine, Column, Integer, String, JSON, TIMESTAMP
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker
 from datetime import datetime
-import re
 
 app = Flask(__name__)
 CORS(app)
-
-# Initialize EasyOCR reader
-reader = easyocr.Reader(['en'])
 
 # Database setup
 DATABASE_URL = "postgresql+psycopg2://passport_user:passport_password@localhost/passport_ocr_db"
@@ -33,13 +27,13 @@ Base.metadata.create_all(bind=engine)
 
 @app.route("/", methods=["GET"])
 def root():
-    return jsonify({"message": "Passport OCR Flask Backend Working"})
+    return jsonify({"message": "OCR.Space Passport OCR Flask Backend Running"})
 
 def parse_mrz(mrz_lines):
     data = {}
     if len(mrz_lines) >= 2:
-        line1 = mrz_lines[0].replace(' ', '').replace('\n', '')
-        line2 = mrz_lines[1].replace(' ', '').replace('\n', '')
+        line1 = mrz_lines[0]
+        line2 = mrz_lines[1]
 
         data['document_type'] = line1[0] if len(line1) > 0 else ""
         data['issuing_country'] = line1[2:5] if len(line1) >= 5 else ""
@@ -55,10 +49,9 @@ def parse_mrz(mrz_lines):
         if len(dob_raw) == 6:
             data['date_of_birth'] = f"19{dob_raw[0:2]}-{dob_raw[2:4]}-{dob_raw[4:6]}"
 
-        if len(line2) >= 21:
-            gender_value = line2[20]
-            if gender_value in ['M', 'F']:
-                data['gender'] = gender_value
+        gender_value = line2[20] if len(line2) >= 21 else ""
+        if gender_value in ['M', 'F']:
+            data['gender'] = gender_value
 
         expiry_raw = line2[21:27] if len(line2) >= 27 else ""
         if len(expiry_raw) == 6:
@@ -67,61 +60,61 @@ def parse_mrz(mrz_lines):
     return data
 
 @app.route("/upload", methods=["POST"])
-def upload_image():
+def upload_passport():
     try:
-        print("== Upload endpoint called ==")
         file = request.files["file"]
-        contents = file.read()
-        print(f"File read: {len(contents)} bytes")
+        file_bytes = file.read()
 
-        image = Image.open(io.BytesIO(contents)).convert('RGB')
-        print("Image converted to RGB")
-        image_array = np.array(image)
-        print("Image converted to numpy array")
+        # OCR.Space API call
+        api_key = "K89968979888957"
+        response = requests.post(
+            "https://api.ocr.space/parse/image",
+            files={"file": (file.filename, file_bytes)},
+            data={"apikey": api_key, "OCREngine": 2, "isTable": True},
+        )
+        result = response.json()
 
-        # Perform OCR using EasyOCR
-        results = reader.readtext(image_array, detail=0, paragraph=False)
-        print(f"OCR Results: {results}")
+        if result.get("IsErroredOnProcessing"):
+            return jsonify({"error": result.get("ErrorMessage", "OCR processing failed")}), 500
+
+        parsed_text = result["ParsedResults"][0]["ParsedText"]
 
         # Extract MRZ lines
-        mrz_lines = results[-2:] if len(results) >= 2 else results
-        mrz_lines = [line.replace(" ", "").replace("\n", "") for line in mrz_lines]
-        print(f"Detected MRZ Lines: {mrz_lines}")
+        mrz_matches = re.findall(r'[A-Z0-9<]{30,}', parsed_text)
+        mrz_lines = mrz_matches[-2:] if len(mrz_matches) >= 2 else mrz_matches
 
         structured_data = parse_mrz(mrz_lines)
 
-        # Extract 'date_of_issue' from OCR results
+        # Date of Issue Extraction
         date_of_issue = None
-        for line in results:
-            found_dates = re.findall(r'\d{2}/\d{2}/\d{4}', line)
-            for dt in found_dates:
-                # Convert to YYYY-MM-DD
-                day, month, year = dt.split("/")
-                formatted_date = f"{year}-{month}-{day}"
-                if (
-                    formatted_date != structured_data.get('date_of_birth') and
-                    formatted_date != structured_data.get('expiration_date')
-                ):
-                    date_of_issue = formatted_date
-                    break
-            if date_of_issue:
+        found_dates = re.findall(r'\d{2}/\d{2}/\d{4}', parsed_text)
+        for dt in found_dates:
+            day, month, year = dt.split("/")
+            formatted_date = f"{year}-{month}-{day}"
+            if formatted_date != structured_data.get('date_of_birth') and formatted_date != structured_data.get('expiration_date'):
+                date_of_issue = formatted_date
                 break
-
         if date_of_issue:
             structured_data['date_of_issue'] = date_of_issue
-            print(f"Date of Issue found: {date_of_issue}")
 
-        # Save to database
+        if not any(structured_data.values()):
+            return jsonify({
+                "error": "No valid MRZ data detected in the uploaded image. Please ensure the image is clear and contains a readable passport MRZ."
+            }), 422
+
+        # Save structured_data with raw_text internally for logs
+        structured_data_for_db = structured_data.copy()
+        structured_data_for_db["raw_text"] = parsed_text
+
         db = SessionLocal()
         passport_entry = PassportData(
             filename=file.filename,
-            extracted_data=structured_data
+            extracted_data=structured_data_for_db
         )
         db.add(passport_entry)
         db.commit()
         db.refresh(passport_entry)
         db.close()
-        print(f"Saved entry with ID: {passport_entry.id}")
 
         return jsonify({
             "id": passport_entry.id,
@@ -132,7 +125,7 @@ def upload_image():
 
     except Exception as e:
         print(f"Error: {e}")
-        return jsonify({"error": str(e)}), 500
+        return jsonify({"error": f"Error uploading or extracting data: {str(e)}"}), 500
 
 if __name__ == "__main__":
     app.run(debug=True, port=8000)
